@@ -1,0 +1,49 @@
+diff --git a/src/libime/table/tablecontext.cpp b/src/libime/table/tablecontext.cpp
+index 2b7c18a..395a34f 100644
+--- a/src/libime/table/tablecontext.cpp
++++ b/src/libime/table/tablecontext.cpp
+@@ -110,6 +110,19 @@ struct SelectedCode {
+ bool shouldReplaceCandidate(const SentenceResult &oldSentence,
+                             const SentenceResult &newSentence,
+                             OrderPolicy policy) {
++    const auto *newNode =
++        static_cast<const TableLatticeNode *>(newSentence.sentence()[0]);
++    const auto *oldNode =
++        static_cast<const TableLatticeNode *>(oldSentence.sentence()[0]);
++    // 用户主动提升/造词的候选(User flag)应优先于普通候选:
++    //  - 新候选是 User → 替换(让提升生效)
++    //  - 旧候选是 User 而新候选不是 → 保留(避免被普通词覆盖)
++    if (newNode->flag() == PhraseFlag::User) {
++        return true;
++    }
++    if (oldNode->flag() == PhraseFlag::User) {
++        return false;
++    }
+     if (newSentence.sentence().size() != oldSentence.sentence().size()) {
+         return newSentence.sentence().size() < oldSentence.sentence().size();
+     }
+@@ -122,23 +135,15 @@ bool shouldReplaceCandidate(const SentenceResult &oldSentence,
+             return oldCode < newCode;
+         }
+ 
+-        const auto *newNode =
+-            static_cast<const TableLatticeNode *>(newSentence.sentence()[0]);
+         switch (policy) {
+         case OrderPolicy::No:
+-            if (newNode->flag() != PhraseFlag::User) {
+-                return true;
+-            }
+-            break;
++            return true;
+         case OrderPolicy::Freq:
+             if (newSentence.score() != oldSentence.score()) {
+                 return newSentence.score() > oldSentence.score();
+             }
+             [[fallthrough]];
+         case OrderPolicy::Fast:
+-            if (newNode->flag() == PhraseFlag::User) {
+-                return true;
+-            }
+             break;
+         }
+     }

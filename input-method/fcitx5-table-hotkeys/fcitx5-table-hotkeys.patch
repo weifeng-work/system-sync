@@ -1,0 +1,469 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 2348564..fdbb423 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -11,7 +11,7 @@ include(ECMSetupVersion)
+ include(ECMUninstallTarget)
+ 
+ find_package(Fcitx5Core ${REQUIRED_FCITX_VERSION} REQUIRED)
+-find_package(Fcitx5Module REQUIRED COMPONENTS Notifications QuickPhrase Spell Clipboard)
++find_package(Fcitx5Module REQUIRED COMPONENTS Notifications QuickPhrase Spell Clipboard Punctuation PinyinHelper)
+ find_package(Fcitx5ModuleLuaAddonLoader)
+ find_package(Pthread REQUIRED)
+ find_package(PkgConfig REQUIRED)
+@@ -84,16 +84,7 @@ add_definitions(-DFCITX_GETTEXT_DOMAIN=\"fcitx5-chinese-addons\")
+ add_definitions(-DQT_NO_KEYWORDS)
+ fcitx5_add_i18n_definition()
+ 
+-add_subdirectory(modules)
+ add_subdirectory(im)
+-add_subdirectory(po)
+-add_subdirectory(tools)
+-
+-if (ENABLE_GUI)
+-    add_subdirectory(gui)
+-endif()
+-
+-add_subdirectory(icon)
+ 
+ if (ENABLE_TEST)
+     find_package(Fcitx5ModuleTestFrontend REQUIRED)
+diff --git a/im/CMakeLists.txt b/im/CMakeLists.txt
+index e79e539..3faf90b 100644
+--- a/im/CMakeLists.txt
++++ b/im/CMakeLists.txt
+@@ -1,2 +1,2 @@
+-add_subdirectory(pinyin)
+ add_subdirectory(table)
++add_subdirectory(tablehotkey)
+diff --git a/im/table/CMakeLists.txt b/im/table/CMakeLists.txt
+index 9a83e7d..1dabdbd 100644
+--- a/im/table/CMakeLists.txt
++++ b/im/table/CMakeLists.txt
+@@ -5,6 +5,7 @@ set(TABLE_SOURCES
+     context.cpp
+     candidate.cpp
+     factory.cpp
++    hotkey.cpp
+ )
+ add_fcitx5_addon(table ${TABLE_SOURCES})
+ target_link_libraries(table Fcitx5::Core Fcitx5::Config LibIME::Table LibIME::Pinyin Boost::iostreams Fcitx5::Module::Punctuation Fcitx5::Module::QuickPhrase Fcitx5::Module::PinyinHelper ${FMT_TARGET})
+diff --git a/im/table/engine.cpp b/im/table/engine.cpp
+index 0b9dfa5..cfc4aeb 100644
+--- a/im/table/engine.cpp
++++ b/im/table/engine.cpp
+@@ -54,6 +54,9 @@
+ 
+ namespace fcitx {
+ 
++// 由 hotkey.cpp 定义,这里声明以更新“当前聚焦 InputContext 的 TableState”。
++extern TableState *g_activeTableState;
++
+ TableEngine::TableEngine(Instance *instance)
+     : instance_(instance),
+       factory_([this](InputContext &ic) { return new TableState(&ic, this); }) {
+@@ -193,6 +196,7 @@ void TableEngine::activate(const fcitx::InputMethodEntry &entry,
+                            fcitx::InputContextEvent &event) {
+     auto *inputContext = event.inputContext();
+     auto *state = inputContext->propertyFor(&factory_);
++    g_activeTableState = state;
+     auto *context = state->updateContext(&entry);
+     if (stringutils::startsWith(entry.languageCode(), "zh_")) {
+         chttrans();
+@@ -241,6 +245,7 @@ void TableEngine::keyEvent(const InputMethodEntry &entry, KeyEvent &event) {
+ 
+     auto *inputContext = event.inputContext();
+     auto *state = inputContext->propertyFor(&factory_);
++    g_activeTableState = state;
+     state->keyEvent(entry, event);
+ }
+ 
+diff --git a/im/table/hotkey.cpp b/im/table/hotkey.cpp
+new file mode 100644
+index 0000000..d9dc2c1
+--- /dev/null
++++ b/im/table/hotkey.cpp
+@@ -0,0 +1,42 @@
++/*
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ *
++ * 调序 / 删词 的“内核钩子”。
++ * 这里只暴露 C 接口供外部插件模块(tablehotkey)调用,
++ * 真正的动作在 TableState 中完成。内核改动保持最小。
++ * 造词使用原版 ModifyDictionary 模式,不在此处处理。
++ */
++#include "state.h"
++
++namespace fcitx {
++
++// 当前聚焦 InputContext 对应的 TableState,由 TableEngine 在按键/激活时更新。
++TableState *g_activeTableState = nullptr;
++
++} // namespace fcitx
++
++extern "C" {
++
++// 调序:将第 idx 个候选词提升为用户词组(提升词频,使其更靠前)。
++// 返回 true 表示成功。
++__attribute__((visibility("default"))) bool
++fcitx5_table_promote_candidate(int idx) {
++    using namespace fcitx;
++    if (!g_activeTableState || idx < 0) {
++        return false;
++    }
++    return g_activeTableState->promoteCandidate(static_cast<size_t>(idx));
++}
++
++// 删词:将第 idx 个候选词从词典和历史中移除。
++// 返回 true 表示成功。
++__attribute__((visibility("default"))) bool
++fcitx5_table_forget_candidate(int idx) {
++    using namespace fcitx;
++    if (!g_activeTableState || idx < 0) {
++        return false;
++    }
++    return g_activeTableState->forgetCandidateByIndex(static_cast<size_t>(idx));
++}
++
++} // extern "C"
+diff --git a/im/table/state.cpp b/im/table/state.cpp
+index 830db8c..6a59ca4 100644
+--- a/im/table/state.cpp
++++ b/im/table/state.cpp
+@@ -39,6 +39,7 @@
+ #include <libime/pinyin/pinyinencoder.h>
+ #include <libime/pinyin/shuangpinprofile.h>
+ #include <libime/table/tablebaseddictionary.h>
++#include <libime/table/tableoptions.h>
+ #include <map>
+ #include <memory>
+ #include <string>
+@@ -736,14 +737,17 @@ void TableState::forgetCandidateWord(size_t idx) {
+     // Make a copy of old code since it will be cleared later.
+     const std::string oldCode = context_->currentCode();
+     auto code = TableContext::code(context_->candidates()[idx]);
+-    if (!code.empty()) {
+-        auto word = context_->candidates()[idx].toString();
+-        commitBuffer(false);
+-        context_->mutableDict().removeWord(code, word);
+-        context_->mutableModel().history().forget(word);
+-    } else {
++    // 词组候选 TableContext::code() 返回空串,改用当前输入编码。
++    if (code.empty()) {
++        code = context_->userInput();
++    }
++    if (code.empty()) {
+         return;
+     }
++    auto word = context_->candidates()[idx].toString();
++    commitBuffer(false);
++    context_->mutableDict().removeWord(code, word);
++    context_->mutableModel().history().forget(word);
+     context_->clear();
+     {
+         const CommitAfterSelectWrapper commitAfterSelectRAII(this);
+@@ -1438,4 +1442,58 @@ void TableState::updatePuncPreedit(InputContext *inputContext) {
+     }
+ }
+ 
++bool TableState::forgetCandidateByIndex(size_t idx) {
++    auto *context = context_.get();
++    if (!context) {
++        return false;
++    }
++    if (idx >= context->candidates().size()) {
++        return false;
++    }
++    forgetCandidateWord(idx);
++    return true;
++}
++
++bool TableState::promoteCandidate(size_t idx) {
++    auto *context = context_.get();
++    if (!context) {
++        return false;
++    }
++    auto candidates = context->candidates();
++    size_t i = 0;
++    for (auto iter = candidates.begin(); iter != candidates.end();
++         ++iter, ++i) {
++        if (i == idx) {
++            const auto &sr = *iter;
++            std::string word = sr.toString();
++            if (word.empty()) {
++                return false;
++            }
++            std::string candCode = libime::TableContext::code(sr);
++            if (candCode.empty()) {
++                candCode = context->userInput();
++            }
++            if (candCode.empty()) {
++                return false;
++            }
++            // 把候选提升为用户词。libime 的 shouldReplaceCandidate
++            // (tablecontext.cpp)现在允许 User flag 词组替换同编码的
++            // 普通候选,因此插入 User 词后重新解码即可让该词排前。
++            auto ret = context->mutableDict().insert(candCode, word,
++                                                     libime::PhraseFlag::User);
++            if (ret) {
++                // 候选列表是 TableContext::update() 的缓存,直接 insert
++                // 不会刷新。clear 后重新 type 当前编码触发重新解码,
++                // 让被提升的词立即排到前面。
++                const auto oldCode = context->userInput();
++                context->clear();
++                context->type(oldCode);
++                updateUI(false, false);
++            }
++            return ret;
++        }
++    }
++    return false;
++}
++
+ } // namespace fcitx
+diff --git a/im/table/state.h b/im/table/state.h
+index a148feb..b87e109 100644
+--- a/im/table/state.h
++++ b/im/table/state.h
+@@ -79,6 +79,11 @@ public:
+ 
+     auto context() const { return context_.get(); }
+ 
++    // 调序:将第 idx 个候选词提升为用户词组以提升词频(供快捷键调用)
++    bool promoteCandidate(size_t idx);
++    // 删词:将第 idx 个候选词从词典和历史中移除(供快捷键调用)
++    bool forgetCandidateByIndex(size_t idx);
++
+ private:
+     bool handle2nd3rdCandidate(const TableConfig &config, KeyEvent &event);
+     bool handlePuncCandidate(const TableConfig &config, KeyEvent &event);
+diff --git a/im/tablehotkey/CMakeLists.txt b/im/tablehotkey/CMakeLists.txt
+new file mode 100644
+index 0000000..3e878eb
+--- /dev/null
++++ b/im/tablehotkey/CMakeLists.txt
+@@ -0,0 +1,5 @@
++set(TABLEHOTKEY_SOURCES tablehotkey.cpp)
++add_fcitx5_addon(tablehotkey ${TABLEHOTKEY_SOURCES})
++target_link_libraries(tablehotkey Fcitx5::Core ${CMAKE_DL_LIBS})
++install(FILES tablehotkey.conf DESTINATION "${CMAKE_INSTALL_DATADIR}/fcitx5/addon"
++        COMPONENT config)
+diff --git a/im/tablehotkey/tablehotkey.conf b/im/tablehotkey/tablehotkey.conf
+new file mode 100644
+index 0000000..04960eb
+--- /dev/null
++++ b/im/tablehotkey/tablehotkey.conf
+@@ -0,0 +1,10 @@
++[Addon]
++Name=Table Hotkey
++Name[zh_CN]=表输入法快捷键增强
++Comment=Provide hotkeys for table input method: Ctrl+1~9 to adjust order, Ctrl+Shift+1~9 to forget word.
++Comment[zh_CN]=为码表输入法(wubi 等)提供快捷键: Ctrl+1~9 调词序, Ctrl+Shift+1~9 删词(造词用原版 Ctrl+Shift+Z)
++Type=SharedLibrary
++Category=Module
++Library=libtablehotkey
++OnDemand=False
++Version=5.1.12
+diff --git a/im/tablehotkey/tablehotkey.cpp b/im/tablehotkey/tablehotkey.cpp
+new file mode 100644
+index 0000000..cbb25fb
+--- /dev/null
++++ b/im/tablehotkey/tablehotkey.cpp
+@@ -0,0 +1,197 @@
++/*
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ *
++ * 表输入法快捷键增强模块(独立插件)。
++ *  - Ctrl+1~9         : 调词序(把对应候选词提升词频,使其更靠前)
++ *  - Ctrl+Shift+1~9   : 删词(把对应候选词从词典和历史中移除)
++ * 造词使用原版 ModifyDictionary 模式(Ctrl+Shift+Z),不由本模块处理。
++ * 所有热键逻辑都在本模块,通过 dlsym 调用 libtable 导出的钩子完成动作,
++ * 内核(libtable)只暴露调序、删词两个最小钩子。
++ */
++#include <dlfcn.h>
++
++#include <fcitx-utils/handlertable.h>
++#include <fcitx-utils/key.h>
++#include <fcitx-utils/keysym.h>
++#include <fcitx/addonfactory.h>
++#include <fcitx/addoninstance.h>
++#include <fcitx/addonmanager.h>
++#include <fcitx/event.h>
++#include <fcitx/inputcontext.h>
++#include <fcitx/inputcontextmanager.h>
++#include <fcitx/inputmethodentry.h>
++#include <fcitx/instance.h>
++
++namespace fcitx {
++
++typedef bool (*PromoteFn)(int);
++typedef bool (*ForgetFn)(int);
++
++class TableHotkey : public AddonInstance {
++public:
++    TableHotkey(Instance *instance);
++    ~TableHotkey() override;
++
++private:
++    Instance *instance_;
++    std::vector<std::unique_ptr<HandlerTableEntry<EventHandler>>> conns_;
++    PromoteFn promote_ = nullptr;
++    ForgetFn forget_ = nullptr;
++
++    bool resolve();
++    void onKey(Event &event);
++};
++
++TableHotkey::TableHotkey(Instance *instance) : instance_(instance) {
++    conns_.push_back(instance_->watchEvent(
++        EventType::InputContextKeyEvent, EventWatcherPhase::PreInputMethod,
++        [this](Event &event) { onKey(event); }));
++}
++
++TableHotkey::~TableHotkey() = default;
++
++namespace {
++// dladdr 锚点:取本模块加载路径用
++void tablehotkey_anchor() {}
++
++// 返回纯数字键(无 Shift)的候选索引(0~8),非数字键返回 -1。
++// Ctrl+1~9 的 keysym 是数字本身(0x31~0x39)。
++int plainDigitIndex(KeySym sym) {
++    switch (sym) {
++    case FcitxKey_1:
++        return 0;
++    case FcitxKey_2:
++        return 1;
++    case FcitxKey_3:
++        return 2;
++    case FcitxKey_4:
++        return 3;
++    case FcitxKey_5:
++        return 4;
++    case FcitxKey_6:
++        return 5;
++    case FcitxKey_7:
++        return 6;
++    case FcitxKey_8:
++        return 7;
++    case FcitxKey_9:
++        return 8;
++    default:
++        return -1;
++    }
++}
++
++// 返回 Shift+数字 的符号键 keysym 对应的候选索引(0~8),非符号键返回 -1。
++// Ctrl+Shift+1~9 的 keysym 是移位符号(!@#$%^&*()。
++int shiftedDigitIndex(KeySym sym) {
++    switch (sym) {
++    case FcitxKey_exclam:
++        return 0;
++    case FcitxKey_at:
++        return 1;
++    case FcitxKey_numbersign:
++        return 2;
++    case FcitxKey_dollar:
++        return 3;
++    case FcitxKey_percent:
++        return 4;
++    case FcitxKey_asciicircum:
++        return 5;
++    case FcitxKey_ampersand:
++        return 6;
++    case FcitxKey_asterisk:
++        return 7;
++    case FcitxKey_parenleft:
++        return 8;
++    default:
++        return -1;
++    }
++}
++} // namespace
++
++bool TableHotkey::resolve() {
++    if (promote_ && forget_) {
++        return true;
++    }
++    // fcitx5 以 RTLD_LOCAL 加载插件,符号不在全局命名空间;
++    // 且库无 SONAME、不在搜索路径,需用绝对路径 dlopen。
++    // 通过 dladdr 定位本模块所在目录,再拼接 libtable.so。
++    Dl_info info;
++    std::string path = "libtable.so";
++    if (dladdr(reinterpret_cast<void *>(&tablehotkey_anchor), &info) &&
++        info.dli_fname) {
++        std::string fname(info.dli_fname);
++        auto slash = fname.find_last_of('/');
++        if (slash != std::string::npos) {
++            path = fname.substr(0, slash + 1) + "libtable.so";
++        }
++    }
++    void *handle = dlopen(path.c_str(), RTLD_NOW);
++    if (handle) {
++        promote_ = reinterpret_cast<PromoteFn>(
++            dlsym(handle, "fcitx5_table_promote_candidate"));
++        forget_ = reinterpret_cast<ForgetFn>(
++            dlsym(handle, "fcitx5_table_forget_candidate"));
++    }
++    return promote_ != nullptr && forget_ != nullptr;
++}
++
++void TableHotkey::onKey(Event &event) {
++    auto &keyEvent = static_cast<KeyEvent &>(event);
++    if (keyEvent.isRelease()) {
++        return;
++    }
++    auto *ic = keyEvent.inputContext();
++    if (!ic) {
++        return;
++    }
++    const auto *entry = instance_->inputMethodEntry(ic);
++    if (!entry || entry->addon() != "table") {
++        return;
++    }
++
++    const Key &key = keyEvent.key();
++    bool ctrl = key.states().test(KeyState::Ctrl);
++    bool alt = key.states().test(KeyState::Alt);
++
++    fprintf(stderr, "[thk] key=%s sym=0x%x ctrl=%d alt=%d\n",
++            key.toString().c_str(), (unsigned)key.sym(), ctrl, alt);
++
++    if (!ctrl || alt) {
++        return;
++    }
++
++    // 用 keysym 区分是否按了 Shift:
++    //  - Ctrl+2 的 keysym 是 '2'(0x32)→ 调词序
++    //  - Ctrl+Shift+2 的 keysym 是 '@'(0x40)→ 删词
++    // shift 修饰标志在某些环境(X11/部分键盘)下可能为 0,不能依赖。
++    int plainIdx = plainDigitIndex(key.sym());
++    int shiftedIdx = shiftedDigitIndex(key.sym());
++    if (plainIdx >= 0) {
++        // Ctrl+数字 调词序。
++        if (resolve() && promote_ && promote_(plainIdx)) {
++            // 不 accept 按键,让 table 引擎 keyEvent 继续走完
++            // (Ctrl+数字会被当成无效输入忽略),keyEvent 末尾的 updateUI
++            // 会读取已被 clear+type 刷新的 candidates。
++        }
++        return;
++    }
++    if (shiftedIdx >= 0) {
++        // Ctrl+Shift+数字 删词。
++        if (resolve() && forget_ && forget_(shiftedIdx)) {
++            keyEvent.accept();
++        }
++        return;
++    }
++}
++
++class TableHotkeyFactory : public AddonFactory {
++public:
++    AddonInstance *create(AddonManager *manager) override {
++        return new TableHotkey(manager->instance());
++    }
++};
++
++FCITX_ADDON_FACTORY(TableHotkeyFactory)
++
++} // namespace fcitx
