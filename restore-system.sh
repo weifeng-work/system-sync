@@ -1,19 +1,28 @@
 #!/bin/bash
-# System Restore Script for system-sync repository
-# 一键恢复 Debian 系统配置
-
-set -uo pipefail  # More forgiving than -e
+# Fixed System Restore Script - handles non-sudo contexts
+set -uo pipefail
 
 echo "=== System Restore Starting ==="
-echo "Restoring from: https://github.com/weifeng-work/system-sync"
 
-# Determine user home
-USER_HOME="${SUDO_HOME:-/home/$SUDO_USER}"
-[ -z "$USER_HOME" ] && USER_HOME="/home/$(logname)"
+# Determine user home WITHOUT relying on SUDO_ variables (which aren't set in curl | bash)
+if [ -n "$SUDO_USER" ] && [ -d "/home/$SUDO_USER" ]; then
+    USER_HOME="/home/$SUDO_USER"
+elif [ -n "$USER" ] && [ -d "/home/$USER" ]; then
+    USER_HOME="/home/$USER"
+else
+    # Try to detect current user
+    USER_HOME="$(eval echo ~$USER)"
+fi
 
 echo "User home: $USER_HOME"
 
-# 1. Restore APT packages
+# Ensure we have a valid home directory
+if [ ! -d "$USER_HOME" ]; then
+    echo "ERROR: Cannot determine home directory. Exiting."
+    exit 1
+fi
+
+# 1. Restore APT packages (run with apt-get directly, no sudo needed for apt in many configs)
 echo ""
 echo ">>> Step 1: Restoring APT packages..."
 
@@ -21,34 +30,27 @@ echo ">>> Step 1: Restoring APT packages..."
 if [ -f "debian-packages/packages-full.txt" ]; then
     echo "Found package list with $(wc -l < debian-packages/packages-full.txt) entries"
     
-    # Install packages, skipping those already installed
     count=0
-    failed=0
     while read -r pkg; do
-        # Skip empty lines and comments
+        # Skip empty lines
         [ -z "$pkg" ] && continue
-        # Skip deinstall marked packages
-        echo "$pkg" | grep -q '^deinstall' && continue
         
         # Check if already installed
         if ! dpkg -s "$pkg" >/dev/null 2>&1; then
             count=$((count + 1))
-            if [ $count -le 5 ] || [ $count -gt $((count + 10)) ]; then
-                echo "Installing: $pkg"
-            fi
-            apt-get install -y "$pkg" 2>/dev/null || {
-                failed=$((failed + 1))
-                [ $count -le 5 ] && echo "  WARNING: Failed to install $pkg"
-            }
+            echo "Installing: $pkg"
+            apt-get install -y "$pkg" 2>/dev/null || echo "  WARNING: Failed to install $pkg"
         fi
     done < debian-packages/packages-full.txt
     
-    echo "APT: Installed $count packages, $failed failed (may be already installed or missing)"
+    echo "APT: Installed $count packages"
     
     # Fix any broken dependencies
     apt-get -f install -y 2>/dev/null || echo "Warning: apt-get -f install had issues"
 else
-    echo "WARNING: debian-packages/packages-full.txt not found!"
+    echo "WARNING: debian-packages/packages-full.txt not found in current directory"
+    echo "Looking for it at alternative paths..."
+    find / -name "packages-full.txt" -type f 2>/dev/null | head -3
 fi
 
 # 2. Restore fcitx5 configuration
@@ -57,28 +59,13 @@ echo ">>> Step 2: Restoring fcitx5 configuration..."
 
 FCITX5_BACKUP="fcitx5-backup.tar.gz"
 if [ -f "$FCITX5_BACKUP" ]; then
-    # Extract to user config directory
-    tar xzf "$FCITX5_BACKUP" -C "$USER_HOME/.config/" 2>/dev/null || {
-        echo "Warning: Could not extract fcitx5 backup to .config"
-        # Try alternative location
-        tar xzf "$FCITX5_BACKUP" -C /home/$(logname)/.config/ 2>/dev/null
-    }
-    
-    # Fix permissions
-    if [ -f "$USER_HOME/.config/fcitx5/config" ]; then
-        chmod 600 "$USER_HOME/.config/fcitx5/config" 2>/dev/null
-        chown -R "$(whoami):$(whoami)" "$USER_HOME/.config/fcitx5" 2>/dev/null
-        echo "fcitx5 config permissions fixed"
-    fi
-    
-    # Restart input method
-    fcitx5 -r 2>/dev/null || echo "Note: fcitx5 -r failed, you can run manually later"
+    tar xzf "$FCITX5_BACKUP" -C "$USER_HOME/.config/" 2>/dev/null && echo "Extracted fcitx5 config" || echo "Warning: fcitx5 extract"
+    chmod 600 "$USER_HOME/.config/fcitx5/config" 2>/dev/null
+    chown -R "$USER":"$USER" "$USER_HOME/.config/fcitx5" 2>/dev/null
+    fcitx5 -r 2>/dev/null || echo "Note: fcitx5 -r failed, run manually later"
     echo "fcitx5 configuration restored!"
 else
-    echo "WARNING: fcitx5-backup.tar.gz not found in current directory"
-    echo "Looking in repository paths..."
-    # Try to find it
-    find . -name "fcitx5-backup.tar.gz" 2>/dev/null | head -3
+    echo "WARNING: fcitx5-backup.tar.gz not found"
 fi
 
 # 3. Restore /etc essential configuration
@@ -94,10 +81,8 @@ fi
 echo ""
 echo ">>> Step 4: Restoring user shell configuration..."
 if [ -f "user-config/user-config-shells.tar.gz" ]; then
-    tar xzf user-config-user-config-shells.tar.gz -C "$USER_HOME" 2>/dev/null || \
-    tar xzf user-config/user-config-shells.tar.gz -C "$USER_HOME" 2>/dev/null
-    chown -R "$(whoami):$(whoami)" "$USER_HOME/.bashrc" "$USER_HOME/.profile" "$USER_HOME/.gitconfig" 2>/dev/null
-    echo "Shell configuration restored"
+    tar xzf "user-config/user-config-shells.tar.gz" -C "$USER_HOME" 2>/dev/null && echo "Shell config restored" || echo "Warning: shell config"
+    chown -R "$USER":"$USER" "$USER_HOME/.bashrc" "$USER_HOME/.profile" "$USER_HOME/.gitconfig" 2>/dev/null
 else
     echo "WARNING: user-config shells not found"
 fi
@@ -106,10 +91,8 @@ fi
 echo ""
 echo ">>> Step 5: Restoring XFCE configuration..."
 if [ -f "user-config/user-config-xfce.tar.gz" ]; then
-    tar xzf user-config/user-config-xfce.tar.gz -C "$USER_HOME" 2>/dev/null || \
-    tar xzf user-config/user-config-xfce.tar.gz -C "$USER_HOME" 2>/dev/null
-    chown -R "$(whoami):$(whoami)" "$USER_HOME/.config/xfce4" 2>/dev/null
-    echo "XFCE configuration restored"
+    tar xzf "user-config/user-config-xfce.tar.gz" -C "$USER_HOME" 2>/dev/null && echo "XFCE config restored" || echo "Warning: XFCE config"
+    chown -R "$USER":"$USER" "$USER_HOME/.config/xfce4" 2>/dev/null
 else
     echo "WARNING: XFCE config not found"
 fi
@@ -117,12 +100,4 @@ fi
 # 6. Final summary
 echo ""
 echo "=== Restore Complete ==="
-echo ""
-echo "Restored components:"
-echo "  ✓ APT packages (from packages-full.txt)"
-echo "  ✓ fcitx5 configuration (hotkeys, table, profile)"
-echo "  ✓ /etc essential configuration (apt, x11, pulse)"
-echo "  ✓ User shell configuration (bashrc, profile, gitconfig)"
-echo "  ✓ XFCE desktop configuration"
-echo ""
-echo "Important: Please log out and log back in, or run: fcitx5 -r"
+echo "Please log out and log back in, or run: fcitx5 -r"
